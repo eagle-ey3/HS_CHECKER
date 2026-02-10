@@ -541,7 +541,74 @@ def _process_gosreg_file(df: pd.DataFrame, filename: str, category: str) -> List
     return codes
 
 
-# --- 7. LOGIKA: UNIVERSAL (Visi kiti) ---
+# --- 7A. LOGIKA: VII Annex Part A (7A) ---
+def _process_7a_file(df: pd.DataFrame, filename: str, category: str) -> List[Dict]:
+    """
+    SPECIALIZUOTA LOGIKA: (7A) failams.
+    Struktūra: A=Category, B=EU code, C=Control text, D=CN Code (index 3), E=CN text, F=Date.
+    Kodai yra D stulpelyje (index 3), pradedant nuo D3 (row index 2).
+    Extra info: "Control text: " + C stulpelio reikšmė.
+    Kodai formatuojami su taškais pvz. "8517.71.00" -> "85177100".
+    Viename langelyje gali būti keli kodai (atskirti \n).
+    """
+    codes = []
+    code_col_idx = 3   # D stulpelis (fiksuotas)
+    control_col_idx = 2  # C stulpelis (Control text)
+    start_row = 2        # Duomenys prasideda nuo row 2 (D3 langelis)
+
+    for r in range(start_row, len(df)):
+        if code_col_idx >= df.shape[1]:
+            continue
+
+        raw_val = df.iloc[r, code_col_idx]
+        if pd.isna(raw_val):
+            continue
+
+        raw_text = str(raw_val).strip()
+        if not raw_text:
+            continue
+
+        # Viename langelyje gali būti keli kodai, atskirti \n
+        code_lines = re.split(r'[\n\r]+', raw_text)
+
+        for line in code_lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            # Valymas: pašaliname taškus, tarpus, nbsp
+            clean = line.replace('.', '').replace(' ', '').replace('\u00A0', '')
+
+            # Tikriname ar tai skaitmeninis kodas
+            match = re.match(r'^(\d{4,10})', clean)
+            if not match:
+                continue
+
+            final_code = match.group(1)
+
+            # Extra info iš C stulpelio (Control text)
+            extra = ""
+            if control_col_idx < df.shape[1]:
+                ctrl_val = df.iloc[r, control_col_idx]
+                if not pd.isna(ctrl_val):
+                    ctrl_text = str(ctrl_val).strip().replace('\n', ' ')
+                    extra = f"Control text: {ctrl_text}"
+
+            if not extra:
+                extra = "VII Appendix A (See source)"
+
+            codes.append({
+                "code": final_code,
+                "category": category,
+                "source": filename,
+                "extra_info": extra,
+                "context": f"{final_code} | {extra}"
+            })
+
+    return codes
+
+
+# --- 8. LOGIKA: UNIVERSAL (Visi kiti) ---
 def _process_universal_file(df: pd.DataFrame, filename: str, category: str) -> List[Dict]:
     codes = []
     keywords = ['kn kodas', 'cn code', 'kodas', 'code', 'kn code', 'hs code']
@@ -623,6 +690,8 @@ def load_excel_csv_data(data_folder_str: str) -> List[Dict]:
                 file_codes = _process_fito_file(df, filename, category)
             elif "(gosreg)" in filename_lower: # <--- NAUJAS MARŠRUTAS (GOSREG)
                 file_codes = _process_gosreg_file(df, filename, category)
+            elif "(7a)" in filename_lower:  # <--- IZOLIUOTA (7A) LOGIKA
+                file_codes = _process_7a_file(df, filename, category)
             else:
                 file_codes = _process_universal_file(df, filename, category)
 
