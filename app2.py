@@ -77,6 +77,7 @@ def categorize_file(filename: str) -> str:
     if "(tru)" in filename_lower: return "RU transit sanctions"
     elif "(fito)" in filename_lower: return "Phytosanitary Restriction (FITO)"
     elif "(gosreg)" in filename_lower: return "Gos. Registracija" # <--- NAUJA KATEGORIJA
+    elif "(vet)" in filename_lower: return "Veterinary Control (VET)"
     elif "(embargo)" in filename_lower: return "Russian Embargo (GLONASS via RU)"
     elif "(lv_ru)" in filename_lower: return "EU sanctions for BY"
     elif "(du)" in filename_lower: return "Dvejopo naudojimo prekės (Dual Use)"
@@ -541,6 +542,102 @@ def _process_gosreg_file(df: pd.DataFrame, filename: str, category: str) -> List
     return codes
 
 
+# --- 7. LOGIKA: VET (Veterinariniai reikalavimai) ---
+def _process_vet_file(df: pd.DataFrame, filename: str, category: str) -> List[Dict]:
+    """
+    SPECIALIZUOTA LOGIKA: (VET) failams.
+    Struktūra: A=Код ТН ВЭД, B=Наименование товара, C=Примечание.
+    Specifika:
+      - Ląstelėje gali būti keli kodai atskirti kableliais arba \n
+      - Prefiksas "из" (= "ex") turi būti pašalintas
+      - "из группы XX" eilutės praleidžiamos (per plačios)
+    """
+    codes = []
+    code_keywords = ['код тн вэд', 'тн вэд', 'код']
+    header_idx = -1
+    code_col_idx = -1
+    desc_col_idx = -1
+
+    # 1. Ieškome antraštės
+    for r in range(min(20, len(df))):
+        row_vals = df.iloc[r].fillna('').astype(str).str.lower().tolist()
+        for c, val in enumerate(row_vals):
+            if any(k in val for k in code_keywords):
+                header_idx = r
+                code_col_idx = c
+                for c2, val2 in enumerate(row_vals):
+                    if 'наименование' in val2:
+                        desc_col_idx = c2
+                        break
+                break
+        if header_idx != -1:
+            break
+
+    # Fallback
+    if header_idx == -1:
+        header_idx = 0
+        code_col_idx = 0
+        desc_col_idx = 1
+
+    # 2. Traukiame duomenis
+    for r in range(header_idx + 1, len(df)):
+        if code_col_idx >= df.shape[1]:
+            continue
+
+        raw_val = df.iloc[r, code_col_idx]
+        if pd.isna(raw_val):
+            continue
+
+        raw_text = str(raw_val).strip()
+        if not raw_text:
+            continue
+
+        # Praleidžiame "из группы XX" - per plačios kategorijos
+        if 'группы' in raw_text.lower():
+            continue
+
+        # Aprašymas iš B stulpelio (bendra visai eilutei)
+        extra = ""
+        if desc_col_idx != -1 and desc_col_idx < df.shape[1]:
+            desc_val = df.iloc[r, desc_col_idx]
+            if not pd.isna(desc_val):
+                extra = str(desc_val).strip().replace('\n', ' ')
+
+        # Ląstelėje gali būti keli kodai atskirti , arba \n
+        chunks = re.split(r'[,\n]+', raw_text)
+
+        for chunk in chunks:
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+
+            # Pašaliname "из " prefiksą
+            chunk = re.sub(r'^из\s+', '', chunk, flags=re.IGNORECASE)
+
+            # Valymas: taškai, tarpai, nbsp
+            clean = chunk.replace('.', '').replace(' ', '').replace('\u00A0', '')
+
+            # Ištraukiame skaitmenis nuo pradžios
+            match = re.match(r'^(\d{4,10})', clean)
+            if not match:
+                continue
+
+            final_code = match.group(1)
+
+            if not extra:
+                extra = "VET (See source)"
+
+            codes.append({
+                "code": final_code,
+                "category": category,
+                "source": filename,
+                "extra_info": extra,
+                "context": f"{final_code} | {extra}"
+            })
+
+    return codes
+
+
 # --- 7A. LOGIKA: VII Annex Part A (7A) ---
 def _process_7a_file(df: pd.DataFrame, filename: str, category: str) -> List[Dict]:
     """
@@ -690,6 +787,8 @@ def load_excel_csv_data(data_folder_str: str) -> List[Dict]:
                 file_codes = _process_fito_file(df, filename, category)
             elif "(gosreg)" in filename_lower: # <--- NAUJAS MARŠRUTAS (GOSREG)
                 file_codes = _process_gosreg_file(df, filename, category)
+            elif "(vet)" in filename_lower:  # <--- IZOLIUOTA (VET) LOGIKA
+                file_codes = _process_vet_file(df, filename, category)
             elif "(7a)" in filename_lower:  # <--- IZOLIUOTA (7A) LOGIKA
                 file_codes = _process_7a_file(df, filename, category)
             else:
@@ -879,6 +978,7 @@ def extract_tags_from_matches(matches: List[Dict]) -> str:
         elif "(embargo)" in src: tags.add("EMBARGO")
         elif "(fito)" in src: tags.add("FITO")
         elif "(gosreg)" in src: tags.add("GOSREG") # <--- Naujas tagas
+        elif "(vet)" in src: tags.add("VET")
         elif "(tr)" in src: tags.add("TR")
         elif "(sa)" in src: tags.add("SA")
         elif "(lv)" in src: tags.add("LV")
@@ -960,6 +1060,7 @@ def main():
                     elif "(ru)" in fname or "transit" in fname or "(tr)" in fname: icon = "🚫"
                     elif "(embargo)" in fname: icon = "⛔"
                     elif "(fito)" in fname: icon = "🌿"
+                    elif "(vet)" in fname: icon = "🐄"
                     elif "(gosreg)" in fname: icon = "📋"
                     elif "(glonass)" in fname: icon = "🛰️"
                     elif "(lv)" in fname: icon = "🇱🇹"
