@@ -167,7 +167,7 @@ def identify_table_columns_universal(rows: List[Any], is_docx: bool = False) -> 
 # --- DATA LOADERS (DOCX) ---
 
 @st.cache_data
-def load_docx_data() -> Tuple[List[Dict], int]:
+def load_docx_data(_version: int = 2) -> Tuple[List[Dict], int]:
     data_folder = Path(DATA_FOLDER)
     if not data_folder.exists() or not DOCX_AVAILABLE:
         return [], 0
@@ -758,7 +758,7 @@ def _process_universal_file(df: pd.DataFrame, filename: str, category: str) -> L
 
 # --- MAIN DISPATCHER ---
 @st.cache_data
-def load_excel_csv_data(data_folder_str: str) -> List[Dict]:
+def load_excel_csv_data(data_folder_str: str, _version: int = 2) -> List[Dict]:
     all_codes = []
     data_folder = Path(data_folder_str)
     all_files = list(data_folder.glob("*.xlsx")) + list(data_folder.glob("*.csv"))
@@ -803,7 +803,7 @@ def load_excel_csv_data(data_folder_str: str) -> List[Dict]:
 # --- DATA LOADERS (PDF & MASTER) ---
 
 @st.cache_data
-def load_pdf_data() -> Tuple[List[Dict], int]:
+def load_pdf_data(_version: int = 2) -> Tuple[List[Dict], int]:
     data_folder = Path(DATA_FOLDER)
     if not data_folder.exists(): return [], 0
     all_codes = []
@@ -896,7 +896,7 @@ def validate_taric_code(code: str, valid_taric_codes: set) -> bool:
     return False
 
 @st.cache_data
-def load_all_data() -> Tuple[List[Dict], int]:
+def load_all_data(_version: int = 2) -> Tuple[List[Dict], int]:
     data_folder = Path(DATA_FOLDER)
     if not data_folder.exists(): return [], 0
     all_codes = []
