@@ -83,6 +83,7 @@ def categorize_file(filename: str) -> str:
     elif "(du)" in filename_lower: return "Dvejopo naudojimo prekės (Dual Use)"
     elif "(glonass)" in filename_lower: return "Glonass navigation seal requirement"
     elif "(7a)" in filename_lower: return "VII Appendix A, possible transit restriction"
+    elif "(nav)" in filename_lower: return "EAEU Navigation Restrictions (NAV)"
     elif "(lv)" in filename_lower or filename_lower.startswith("(lv)"): return "Lithuanian National Sanctions"
     elif filename_lower.startswith("(sa)"): return "EU Sanctions"
     elif filename_lower.startswith("(tr)"): return "Transit Restrictions"
@@ -167,7 +168,7 @@ def identify_table_columns_universal(rows: List[Any], is_docx: bool = False) -> 
 # --- DATA LOADERS (DOCX) ---
 
 @st.cache_data
-def load_docx_data(_version: int = 2) -> Tuple[List[Dict], int]:
+def load_docx_data(_version: int = 3) -> Tuple[List[Dict], int]:
     data_folder = Path(DATA_FOLDER)
     if not data_folder.exists() or not DOCX_AVAILABLE:
         return [], 0
@@ -638,6 +639,245 @@ def _process_vet_file(df: pd.DataFrame, filename: str, category: str) -> List[Di
     return codes
 
 
+# --- 7B. LOGIKA: NAV (Navigaciniai apribojimai - EAEU PDF) ---
+
+def _nav_extract_code(text: str):
+    """Ištraukia vieną CN kodą iš teksto fragmento. Grąžina sanitizuotą kodą arba None."""
+    if not text:
+        return None
+    clean = re.sub(r'(?i)\bиз\b|\bза\b|\bисключением\b|[():\*]', ' ', text)
+    clean = re.sub(r'\s+', ' ', clean).strip()
+    digits_only = re.sub(r'[^0-9\s]', '', clean)
+    parts = digits_only.split()
+    joined = ''.join(parts)
+    if len(joined) >= 4 and joined.isdigit():
+        return joined[:10]
+    return None
+
+def _nav_parse_code_cell(raw_text: str) -> List[Dict]:
+    """
+    Parsina vieną NAV kodo langelį.
+    Grąžina sąrašą: [{'code': '...', 'exclusions': ['...', ...]}, ...]
+    Apdoroja:
+      - "из XXXX" prefiksus (pašalinami)
+      - Kelis kodus per kablelį
+      - "за исключением" (exclusion) logiką su ir be skliaustų
+      - Brūkšnio diapazonus "XXXX YY - XXXX ZZ"
+    """
+    if not raw_text:
+        return []
+
+    text = raw_text.replace('\n', ' ').replace('\r', ' ')
+    text = re.sub(r'\s+', ' ', text).strip()
+    text = re.sub(r'(?i)\bиз\s+', '', text)
+
+    # Brūkšnio diapazonas -> du atskiri kodai
+    text = re.sub(r'\s*-\s*(?=\d)', ', ', text)
+
+    results = []
+
+    # Skilti pagal "за исключением" (su arba be skliaustų)
+    segments = re.split(r'(?:,\s*)?(?:\(?\s*за\s+исключением\s*:?\s*)', text, flags=re.IGNORECASE)
+
+    if len(segments) == 1:
+        # Jokių exclusion - paprastas split per kablelį
+        for chunk in re.split(r'[,]+', text):
+            code = _nav_extract_code(chunk.strip())
+            if code:
+                results.append({'code': code, 'exclusions': []})
+        return results
+
+    # Yra exclusion
+    pending_includes = []
+
+    # Pradiniai include kodai
+    for chunk in re.split(r'[,]+', segments[0]):
+        code = _nav_extract_code(chunk.strip())
+        if code:
+            pending_includes.append(code)
+
+    for seg in segments[1:]:
+        # Segmentas prasideda exclusion kodais
+        # Gali turėti ) ir po to daugiau include kodų
+        paren_split = re.split(r'\)\s*,?\s*', seg, maxsplit=1)
+        has_parens = len(paren_split) > 1 or ')' in seg
+        excl_text = paren_split[0]
+        after_paren = paren_split[1] if len(paren_split) > 1 else ""
+
+        # Parsinti exclusion kodus (split per kablelį ir "и")
+        excl_candidates = []
+        for ec in re.split(r'[,]+|\s+и\s+', excl_text):
+            code = _nav_extract_code(ec.strip())
+            if code:
+                excl_candidates.append(code)
+
+        # Paskutinis pending include gauna exclusions
+        main_code = pending_includes[-1] if pending_includes else None
+
+        if main_code and not has_parens:
+            # Be skliaustų - euristika: tik kodai su tuo pačiu 4-skaitmenų prefiksu = exclusion
+            # Kiti kodai grąžinami kaip includes
+            real_exclusions = []
+            returned_includes = []
+            for ec in excl_candidates:
+                if ec[:4] == main_code[:4]:
+                    real_exclusions.append(ec)
+                else:
+                    returned_includes.append(ec)
+            if pending_includes:
+                pending_includes.pop()
+            results.append({'code': main_code, 'exclusions': real_exclusions})
+            pending_includes.extend(returned_includes)
+        elif main_code:
+            # Su skliaustais - visi candidates yra exclusions
+            if pending_includes:
+                pending_includes.pop()
+            results.append({'code': main_code, 'exclusions': excl_candidates})
+
+        # Kodai po skliaustų uždarančiojo
+        if after_paren:
+            for chunk in re.split(r'[,]+', after_paren):
+                code = _nav_extract_code(chunk.strip())
+                if code:
+                    pending_includes.append(code)
+
+    # Likę include kodai be exclusion
+    for code in pending_includes:
+        results.append({'code': code, 'exclusions': []})
+
+    return results
+
+
+@st.cache_data
+def load_nav_pdf_data(_version: int = 1) -> List[Dict]:
+    """
+    Įkelia NAV PDF failą ir grąžina kodus su exclusion informacija.
+    Kiekvienas įrašas turi: code, exclusions, category, source, extra_info, context.
+    """
+    data_folder = Path(DATA_FOLDER)
+    if not data_folder.exists():
+        return []
+
+    all_codes = []
+    nav_files = [f for f in data_folder.glob("*.pdf") if "(nav)" in f.name.lower()]
+
+    for nav_file in nav_files:
+        try:
+            category = categorize_file(nav_file.name)
+            source = nav_file.name
+
+            # 1. Ištraukiame visas kodo ląsteles iš PDF lentelių
+            raw_cells = []
+            with pdfplumber.open(nav_file) as pdf:
+                for page_num in range(len(pdf.pages)):
+                    page = pdf.pages[page_num]
+                    tables = page.extract_tables()
+                    if not tables:
+                        continue
+                    for table in tables:
+                        for row in table:
+                            if not row or len(row) < 2:
+                                continue
+                            desc_cell = row[0] if row[0] else ""
+                            code_cell = row[1] if row[1] else ""
+                            code_text = code_cell.strip()
+                            desc_text = desc_cell.strip()
+
+                            # Praleidžiame antraštes
+                            if 'ТН ВЭД' in code_text or code_text in ('2', '') or 'Код' in code_text:
+                                continue
+
+                            # Tęsinys (be aprašymo) = praeitos eilutės tęsinys
+                            is_continuation = (not desc_text)
+
+                            raw_cells.append({
+                                'code_raw': code_text,
+                                'desc_raw': desc_text,
+                                'is_continuation': is_continuation
+                            })
+
+            # 2. Sujungiame tęsinius (cross-page cells)
+            merged = []
+            for cell in raw_cells:
+                if cell['is_continuation'] and merged:
+                    merged[-1]['code_raw'] += ' ' + cell['code_raw']
+                else:
+                    merged.append(cell.copy())
+
+            # 3. Parsiname kodus
+            for m in merged:
+                parsed = _nav_parse_code_cell(m['code_raw'])
+                desc = m['desc_raw'].replace('\n', ' ')[:200] if m['desc_raw'] else ""
+
+                for p in parsed:
+                    excl_str = ""
+                    if p['exclusions']:
+                        excl_str = f" [IŠSKYRUS: {', '.join(p['exclusions'])}]"
+
+                    extra = desc + excl_str if desc else f"NAV (See source){excl_str}"
+
+                    all_codes.append({
+                        "code": p['code'],
+                        "exclusions": p['exclusions'],
+                        "category": category,
+                        "source": source,
+                        "extra_info": extra,
+                        "context": f"{p['code']} | {extra}"
+                    })
+
+        except Exception:
+            continue
+
+    return all_codes
+
+
+def is_nav_match(user_input: str, entry: Dict) -> Tuple[bool, str]:
+    """
+    NAV paieškos logika su exclusion palaikymu.
+    1. Tikrina ar user kodas patenka į entry['code'] hierarchiją
+    2. Jei taip, tikrina ar nepatenka į exclusion sąrašą
+    Grąžina (matched, parent_code)
+    """
+    u = str(user_input).strip()
+    d = str(entry.get("code", "")).strip()
+    exclusions = entry.get("exclusions", [])
+
+    if not u or not d:
+        return (False, "")
+
+    # Hierarchinis matchinimas
+    is_match = False
+    parent = ""
+
+    if u == d:
+        is_match = True
+    elif len(d) >= 4 and u.startswith(d):
+        # User kodas yra specifikesnis nei DB kodas (pvz user=02011000, db=0201)
+        is_match = True
+        parent = d
+    elif d.startswith(u):
+        # DB kodas yra specifikesnis nei user kodas (pvz user=0201, db=02011000)
+        is_match = True
+        parent = u
+
+    if not is_match:
+        return (False, "")
+
+    # Exclusion tikrinimas
+    for excl in exclusions:
+        excl = str(excl).strip()
+        if u == excl:
+            return (False, "")
+        if len(excl) >= 4 and u.startswith(excl):
+            return (False, "")
+        if excl.startswith(u):
+            # User kodas platesnis nei exclusion - vis tiek match
+            # (pvz user=0701, excl=0701100000 - 0701 vis tiek match nes ne viskas excluded)
+            continue
+
+    return (True, parent)
+
+
 # --- 7A. LOGIKA: VII Annex Part A (7A) ---
 def _process_7a_file(df: pd.DataFrame, filename: str, category: str) -> List[Dict]:
     """
@@ -758,7 +998,7 @@ def _process_universal_file(df: pd.DataFrame, filename: str, category: str) -> L
 
 # --- MAIN DISPATCHER ---
 @st.cache_data
-def load_excel_csv_data(data_folder_str: str, _version: int = 2) -> List[Dict]:
+def load_excel_csv_data(data_folder_str: str, _version: int = 3) -> List[Dict]:
     all_codes = []
     data_folder = Path(data_folder_str)
     all_files = list(data_folder.glob("*.xlsx")) + list(data_folder.glob("*.csv"))
@@ -803,7 +1043,7 @@ def load_excel_csv_data(data_folder_str: str, _version: int = 2) -> List[Dict]:
 # --- DATA LOADERS (PDF & MASTER) ---
 
 @st.cache_data
-def load_pdf_data(_version: int = 2) -> Tuple[List[Dict], int]:
+def load_pdf_data(_version: int = 3) -> Tuple[List[Dict], int]:
     data_folder = Path(DATA_FOLDER)
     if not data_folder.exists(): return [], 0
     all_codes = []
@@ -896,12 +1136,14 @@ def validate_taric_code(code: str, valid_taric_codes: set) -> bool:
     return False
 
 @st.cache_data
-def load_all_data(_version: int = 2) -> Tuple[List[Dict], int]:
+def load_all_data(_version: int = 3) -> Tuple[List[Dict], int]:
     data_folder = Path(DATA_FOLDER)
     if not data_folder.exists(): return [], 0
     all_codes = []
     pdf_codes, pdf_count = load_pdf_data()
     all_codes.extend(pdf_codes)
+    nav_codes = load_nav_pdf_data()
+    all_codes.extend(nav_codes)
     spreadsheet_codes = load_excel_csv_data(str(data_folder))
     all_codes.extend(spreadsheet_codes)
     docx_codes, docx_count = load_docx_data()
@@ -958,6 +1200,13 @@ def search_codes(user_input: str, all_codes: List[Dict]) -> List[Dict]:
                 m = entry.copy()
                 m["matched_parent_code"] = parent
                 matches.append(m)
+        elif "(nav)" in src:
+            # NAV: atskira logika su exclusion palaikymu
+            is_m, parent = is_nav_match(user_input, entry)
+            if is_m:
+                m = entry.copy()
+                m["matched_parent_code"] = parent
+                matches.append(m)
         else:
             # Standartinė hierarchinė paieška (Tinka SA, FITO, GOSREG ir kitiems)
             is_m, parent = is_hierarchical_match(user_input, entry["code"])
@@ -983,6 +1232,7 @@ def extract_tags_from_matches(matches: List[Dict]) -> str:
         elif "(sa)" in src: tags.add("SA")
         elif "(lv)" in src: tags.add("LV")
         elif "(7a)" in src: tags.add("7A")
+        elif "(nav)" in src: tags.add("NAV")
         elif "(glonass)" in src: tags.add("GLONASS")
         else: tags.add("OTHER")
     return "; ".join(sorted(list(tags))) if tags else "OTHER"
@@ -1063,6 +1313,7 @@ def main():
                     elif "(vet)" in fname: icon = "🐄"
                     elif "(gosreg)" in fname: icon = "📋"
                     elif "(glonass)" in fname: icon = "🛰️"
+                    elif "(nav)" in fname: icon = "🚢"
                     elif "(lv)" in fname: icon = "🇱🇹"
                     else: icon = "⚪"
                     ftype = f.suffix.upper().replace('.', '')
